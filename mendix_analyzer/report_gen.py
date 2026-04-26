@@ -4,16 +4,28 @@ Produces a self-contained, professional HTML report from agent outputs.
 """
 import re
 import html
+import zlib
+import base64
 import datetime
 from pathlib import Path
 from typing import Dict, Optional
 from .scanner import ProjectScan
 
 
+def _plantuml_to_kroki_url(source: str) -> str:
+    """Encode PlantUML source for kroki.io rendering (deflate + url-safe base64)."""
+    compressed = zlib.compress(source.encode("utf-8"), 9)
+    encoded = base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
+    return f"https://kroki.io/plantuml/svg/{encoded}"
+
+
 def _md_to_html(text: str) -> str:
-    """Minimal Markdown → HTML conversion (tables, headers, bold, lists, code)."""
+    """Markdown → HTML (tables, headers, bold, lists, code, PlantUML diagrams)."""
     lines = text.split("\n")
     out, in_table, in_ul, in_ol = [], False, False, False
+    in_code = False
+    code_lang = ""
+    code_buf: list = []
 
     def flush_list():
         nonlocal in_ul, in_ol
@@ -27,7 +39,39 @@ def _md_to_html(text: str) -> str:
         if in_table:
             out.append("</tbody></table>"); in_table = False
 
+    def flush_code():
+        nonlocal in_code, code_lang, code_buf
+        if not in_code:
+            return
+        src = "\n".join(code_buf).strip()
+        if code_lang.lower() in ("plantuml", "puml", "uml") and src:
+            url = _plantuml_to_kroki_url(src)
+            out.append(
+                f'<div class="puml"><img src="{url}" alt="PlantUML diagram" '
+                f'loading="lazy"/><details><summary>Show source</summary>'
+                f'<pre class="code">{html.escape(src)}</pre></details></div>')
+        else:
+            cls = f' class="code lang-{html.escape(code_lang)}"' if code_lang else ' class="code"'
+            out.append(f"<pre{cls}>{html.escape(src)}</pre>")
+        in_code = False
+        code_lang = ""
+        code_buf = []
+
     for line in lines:
+        # Fenced code block start/end
+        m_code = re.match(r"^\s*```\s*([A-Za-z0-9_+\-]*)\s*$", line)
+        if m_code:
+            if not in_code:
+                flush_list(); flush_table()
+                in_code = True
+                code_lang = m_code.group(1) or ""
+            else:
+                flush_code()
+            continue
+        if in_code:
+            code_buf.append(line)
+            continue
+
         # Tables
         if line.strip().startswith("|"):
             cells = [c.strip() for c in line.strip().strip("|").split("|")]
@@ -77,7 +121,7 @@ def _md_to_html(text: str) -> str:
         else:
             out.append(f"<p>{_inline(line)}</p>")
 
-    flush_list(); flush_table()
+    flush_list(); flush_table(); flush_code()
     return "\n".join(out)
 
 
@@ -166,6 +210,17 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);
 .badge{padding:1px 5px;border-radius:4px}
 .badge.red{color:var(--red)}.badge.orange{color:var(--orange)}
 .badge.yellow{color:var(--yellow)}.badge.green{color:var(--green)}
+/* Code & PlantUML */
+pre.code{background:#0d1117;color:#c0caf5;padding:14px 16px;border-radius:8px;
+         border:1px solid var(--border);overflow-x:auto;font-family:Consolas,Menlo,monospace;
+         font-size:.85rem;line-height:1.5;margin:12px 0}
+.puml{margin:18px 0;padding:14px;background:#fff;border-radius:10px;
+      border:1px solid var(--border);text-align:center}
+.puml img{max-width:100%;height:auto}
+.puml details{margin-top:8px;text-align:left;background:#0d1117;
+              border-radius:6px;padding:6px 12px}
+.puml summary{cursor:pointer;color:var(--accent2);font-size:.82rem;font-weight:600}
+.puml details pre.code{margin:8px 0 0 0;border:0}
 /* Footer */
 .footer{padding:24px 48px;text-align:center;color:var(--muted);font-size:.8rem;
         border-top:1px solid var(--border)}
@@ -194,11 +249,11 @@ class ReportGenerator:
 </div>"""
 
         nav = "\n".join([
-            '<span class="nav-section">Analysis</span>',
-            '<a class="nav-item" href="#architect">🏗️ Architecture</a>',
-            '<a class="nav-item" href="#ba">💼 Business Analysis</a>',
-            '<a class="nav-item" href="#qa">🧪 QA Report</a>',
-            '<a class="nav-item" href="#consolidation">📄 Consolidation</a>',
+            '<span class="nav-section">9-Section Report</span>',
+            '<a class="nav-item" href="#architect">🏗️ §1-2,7 Architecture &amp; Domain Model</a>',
+            '<a class="nav-item" href="#ba">💼 §4-5 Business &amp; UI Analysis</a>',
+            '<a class="nav-item" href="#qa">🧪 §3,6,8 Microflows · Security · Risks</a>',
+            '<a class="nav-item" href="#consolidation">📄 §9 Final Summary</a>',
         ])
 
         stats_html = "".join([
@@ -236,11 +291,11 @@ class ReportGenerator:
     </div>
   </div>
   <div class="stats">{stats_html}</div>
-  {section("🏗️","Architecture","architect","System structure, modules, integrations & technical risks")}
-  {section("💼","Business Analysis","ba","Actors, processes, epics, user stories & business rules")}
-  {section("🧪","QA Report","qa","Gaps, test scenarios, risk analysis & NFRs")}
-  {section("📄","Consolidation","consolidation","Executive summary & top recommendations")}
-  <div class="footer" id="footer">Generated by Mendix Multi-Agent Analyzer v1.0 · {now}</div>
+  {section("🏗️","Architecture &amp; Domain Model","architect","§1 System Overview · §2 Domain Model · §7 PlantUML Diagrams (ERD, Architecture, Sequence)")}
+  {section("💼","Business &amp; UI Analysis","ba","§4 Actors, Processes, User Stories, Business Rules · §5 UI / Page Analysis")}
+  {section("🧪","Microflows · Security · Risks","qa","§3 Microflow Analysis · §6 Security Analysis · §8 Risks &amp; Improvements")}
+  {section("📄","Final Summary","consolidation","§9 Executive summary, system maturity verdict, critical risks &amp; top recommendations")}
+  <div class="footer" id="footer">Generated by Mendix Multi-Agent Analyzer v1.1 · {now}</div>
 </div></div></body></html>"""
 
     def save(self, scan: ProjectScan, results: Dict[str, str], output_path: str) -> str:

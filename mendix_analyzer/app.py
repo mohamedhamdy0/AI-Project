@@ -78,10 +78,100 @@ class StatusBar(tk.Frame):
         self.dot.configure(fg=color)
 
 
+class LoaderPanel(tk.Frame):
+    """Animated loader shown while the multi-agent analysis is running."""
+    SPINNER_FRAMES = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=CARD, bd=0, highlightthickness=1,
+                         highlightbackground=ACCENT2)
+        self._frame_idx = 0
+        self._running = False
+        self._start_ts = None
+        self._tokens = 0
+        self._stage_label = "Initializing..."
+        self._stage_idx = 0
+        self._stage_total = 4
+
+        # Layout: [Spinner] [Stage info] [Stats]
+        wrap = tk.Frame(self, bg=CARD)
+        wrap.pack(fill="x", padx=18, pady=14)
+
+        self.spinner = tk.Label(wrap, text="⣾", bg=CARD, fg=ACCENT2,
+                                font=("Consolas", 32, "bold"))
+        self.spinner.pack(side="left", padx=(0, 18))
+
+        mid = tk.Frame(wrap, bg=CARD)
+        mid.pack(side="left", fill="x", expand=True)
+        tk.Label(mid, text="ANALYSIS IN PROGRESS", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        self.stage_lbl = tk.Label(mid, text="Initializing...", bg=CARD, fg=ACCENT2,
+                                  font=("Segoe UI", 13, "bold"))
+        self.stage_lbl.pack(anchor="w", pady=(2, 4))
+        self.sub_lbl = tk.Label(mid, text="Step 0 / 4 · 0s elapsed · 0 tokens",
+                                bg=CARD, fg=MUTED, font=FONT_SMALL)
+        self.sub_lbl.pack(anchor="w")
+
+        # Inline mini progress bar
+        self.bar_canvas = tk.Canvas(mid, bg=PANEL, height=6, bd=0,
+                                    highlightthickness=0)
+        self.bar_canvas.pack(fill="x", pady=(8, 0))
+        self.bar_rect = self.bar_canvas.create_rectangle(0, 0, 0, 6,
+                                                         fill=ACCENT2, width=0)
+
+    def start(self, total_stages: int):
+        import time
+        self._running = True
+        self._start_ts = time.time()
+        self._tokens = 0
+        self._stage_idx = 0
+        self._stage_total = max(total_stages, 1)
+        self._stage_label = "Preparing context..."
+        self._animate()
+
+    def stop(self):
+        self._running = False
+        self.spinner.configure(text="✅", fg=GREEN)
+        self.stage_lbl.configure(text="Analysis complete", fg=GREEN)
+
+    def fail(self, msg: str = "Stopped"):
+        self._running = False
+        self.spinner.configure(text="⏹", fg=RED)
+        self.stage_lbl.configure(text=msg, fg=RED)
+
+    def set_stage(self, label: str, idx: int):
+        self._stage_label = label
+        self._stage_idx = idx
+        self.stage_lbl.configure(text=label, fg=ACCENT2)
+
+    def add_tokens(self, n: int = 1):
+        self._tokens += n
+
+    def _animate(self):
+        if not self._running:
+            return
+        import time
+        self._frame_idx = (self._frame_idx + 1) % len(self.SPINNER_FRAMES)
+        self.spinner.configure(text=self.SPINNER_FRAMES[self._frame_idx])
+        elapsed = int(time.time() - (self._start_ts or time.time()))
+        mins, secs = divmod(elapsed, 60)
+        self.sub_lbl.configure(
+            text=f"Step {self._stage_idx} / {self._stage_total}  ·  "
+                 f"{mins:02d}:{secs:02d} elapsed  ·  {self._tokens:,} tokens received")
+        # Progress fill
+        try:
+            w = self.bar_canvas.winfo_width()
+            pct = self._stage_idx / self._stage_total
+            self.bar_canvas.coords(self.bar_rect, 0, 0, int(w * pct), 6)
+        except Exception:
+            pass
+        self.after(120, self._animate)
+
+
 class MendixAnalyzerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("⚡ Mendix Multi-Agent Analyzer v1.0")
+        self.title("⚡ Mendix Multi-Agent Analyzer v1.1")
         self.geometry("1280x820")
         self.minsize(1100, 700)
         self.configure(bg=BG)
@@ -123,7 +213,7 @@ class MendixAnalyzerApp(tk.Tk):
         hdr.pack_propagate(False)
         tk.Label(hdr, text="⚡  Mendix Multi-Agent Analyzer",
                  bg=PANEL, fg=ACCENT2, font=("Segoe UI", 13, "bold")).pack(side="left", padx=20, pady=14)
-        tk.Label(hdr, text="v1.0 • On-Premises AI",
+        tk.Label(hdr, text="v1.1 • 9-Section Analysis • On-Premises AI",
                  bg=PANEL, fg=MUTED, font=FONT_SMALL).pack(side="right", padx=20)
 
         # Body
@@ -218,26 +308,39 @@ class MendixAnalyzerApp(tk.Tk):
         hero.pack(fill="x")
         tk.Label(hero, text="📁  Project Setup", bg=PANEL, fg=TEXT, font=FONT_H1,
                  pady=18, padx=32, anchor="w").pack(fill="x")
-        tk.Label(hero, text="Select a Mendix project directory to scan and analyse.",
-                 bg=PANEL, fg=MUTED, font=FONT, padx=32, anchor="w").pack(fill="x")
+        tk.Label(hero, text="Select a Mendix project directory OR a .mpr file. "
+                            "When an .mpr is supplied, the full model is extracted "
+                            "via `mx dump-mpr` and fed to the AI agents.",
+                 bg=PANEL, fg=MUTED, font=FONT, padx=32, anchor="w",
+                 wraplength=900, justify="left").pack(fill="x")
         tk.Frame(hero, bg=BORDER, height=1).pack(fill="x", pady=(12, 0))
 
-        # Directory picker card
-        self._section_label(inner, "Mendix Project Directory")
+        # Directory / .mpr picker card
+        self._section_label(inner, "Mendix Project Directory or .mpr File")
         card = self._card(inner)
         card.pack(fill="x", padx=32, pady=6, ipadx=4, ipady=4)
 
         dir_row = tk.Frame(card, bg=CARD)
         dir_row.pack(fill="x", padx=16, pady=14)
-        tk.Label(dir_row, text="Directory:", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(anchor="w")
+        tk.Label(dir_row, text="Path (folder or .mpr):", bg=CARD, fg=MUTED,
+                 font=FONT_SMALL).pack(anchor="w")
         row2 = tk.Frame(dir_row, bg=CARD)
         row2.pack(fill="x", pady=(4, 0))
         e = tk.Entry(row2, textvariable=self.var_dir, bg=PANEL, fg=TEXT, insertbackground=TEXT,
                      font=FONT, relief="flat", width=60)
         e.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 8))
-        browse_btn = tk.Button(row2, text="📂 Browse", command=self._browse_dir)
+        mpr_btn = tk.Button(row2, text="📄 .mpr File", command=self._browse_mpr)
+        _style_button(mpr_btn)
+        mpr_btn.pack(side="right", padx=(0, 6))
+        browse_btn = tk.Button(row2, text="📂 Folder", command=self._browse_dir)
         _style_button(browse_btn)
-        browse_btn.pack(side="right")
+        browse_btn.pack(side="right", padx=(0, 6))
+
+        # Progress label for MPR extraction (visible while mx dump-mpr runs)
+        self.scan_progress_lbl = tk.Label(card, text="", bg=CARD, fg=ACCENT2,
+                                          font=FONT_SMALL, anchor="w",
+                                          wraplength=900, justify="left")
+        self.scan_progress_lbl.pack(fill="x", padx=16, pady=(0, 6))
 
         scan_btn = tk.Button(card, text="🔍  Scan Project", command=self._scan_project)
         _style_button(scan_btn, primary=True)
@@ -257,42 +360,97 @@ class MendixAnalyzerApp(tk.Tk):
         if d:
             self.var_dir.set(d)
 
+    def _browse_mpr(self):
+        f = filedialog.askopenfilename(
+            title="Select Mendix .mpr file",
+            filetypes=[("Mendix Project", "*.mpr"), ("All files", "*.*")],
+        )
+        if f:
+            self.var_dir.set(f)
+
     def _scan_project(self):
         d = self.var_dir.get().strip()
         if not d or not Path(d).exists():
-            messagebox.showerror("Error", "Please select a valid directory.")
+            messagebox.showerror("Error", "Please select a valid folder or .mpr file.")
             return
-        self.status_bar.set("Scanning project...", YELLOW)
+        is_mpr = Path(d).is_file() and Path(d).suffix.lower() == ".mpr"
+        self.status_bar.set(
+            "Extracting full MPR dump..." if is_mpr else "Scanning project...",
+            YELLOW)
+        self.scan_progress_lbl.configure(text="Starting scan...", fg=ACCENT2)
         threading.Thread(target=self._do_scan, args=(d,), daemon=True).start()
 
-    def _do_scan(self, directory: str):
+    def _do_scan(self, target: str):
+        def on_progress(msg: str):
+            self.after(0, lambda m=msg: self.scan_progress_lbl.configure(
+                text=m, fg=ACCENT2))
+            self.after(0, lambda m=msg: self.status_bar.set(m, YELLOW))
+            self.log_queue.put((f"[scan] {msg}\n", "info"))
         scanner = MendixScanner()
-        result  = scanner.scan(directory)
+        result  = scanner.scan(target, on_progress=on_progress)
         self.after(0, lambda: self._on_scan_done(result))
 
     def _on_scan_done(self, result: Optional[ProjectScan]):
         if result is None:
-            messagebox.showerror("Scan Failed", "Directory does not appear to be a Mendix project.")
+            messagebox.showerror(
+                "Scan Failed",
+                "The selected path is not a Mendix project directory or .mpr file.")
             self.status_bar.set("Scan failed", RED)
+            self.scan_progress_lbl.configure(text="Scan failed.", fg=RED)
             return
         self.scan_result = result
         self._render_scan_results(result)
-        self.status_bar.set(f"✅ Scanned: {result.project_name} — {result.module_count} modules found", GREEN)
+        if result.mpr_data is not None:
+            c = result.mpr_data.counts
+            self.scan_progress_lbl.configure(
+                text=f"✅ MPR extracted in {result.mpr_data.duration_seconds}s · "
+                     f"{result.mpr_data.raw_unit_count:,} units · "
+                     f"{c['entities']} entities · {c['microflows']} microflows · "
+                     f"{c['pages']} pages · {c['workflows']} workflows",
+                fg=GREEN)
+            self.status_bar.set(
+                f"✅ {result.project_name} — full MPR loaded "
+                f"({c['entities']} entities, {c['microflows']} microflows)", GREEN)
+        else:
+            if result.mpr_path and getattr(result, "mpr_error", ""):
+                self.scan_progress_lbl.configure(
+                    text=f"⚠ MPR extraction failed: {result.mpr_error}", fg=RED)
+                self.status_bar.set(
+                    f"⚠ {result.project_name} — filesystem only "
+                    f"(MPR dump failed: {result.mpr_error})", YELLOW)
+            else:
+                self.scan_progress_lbl.configure(
+                    text="Directory scan complete (no .mpr extracted).", fg=ACCENT2)
+                self.status_bar.set(
+                    f"✅ Scanned: {result.project_name} — {result.module_count} modules found",
+                    GREEN)
 
     def _render_scan_results(self, scan: ProjectScan):
         for w in self.scan_results_frame.winfo_children():
             w.destroy()
 
         biz = scan.business_modules
+        mpr = scan.mpr_data
+        mc = mpr.counts if mpr else {}
 
-        # Stats grid
+        # Stats grid — when MPR data is available, prefer those counts
         stats = [
             ("📦", "Project", scan.project_name),
             ("🏗️", "Mendix Version", scan.mendix_version),
-            ("📚", "Total Modules", str(scan.module_count)),
+            ("📚", "Total Modules",
+             str(mc["modules"]) if mpr else str(scan.module_count)),
             ("🏢", "Business Modules", str(len(biz))),
-            ("📄", "Entities", str(scan.entity_count)),
-            ("🔢", "Enums", str(scan.enum_count)),
+            ("📄", "Entities",
+             str(mc["entities"]) if mpr else str(scan.entity_count)),
+            ("🔗", "Associations", str(mc["associations"]) if mpr else "—"),
+            ("⚙️", "Microflows", str(mc["microflows"]) if mpr else "—"),
+            ("📃", "Pages", str(mc["pages"]) if mpr else "—"),
+            ("🔁", "Workflows", str(mc["workflows"]) if mpr else "—"),
+            ("🔢", "Enums",
+             str(mc["enumerations"]) if mpr else str(scan.enum_count)),
+            ("🔐", "User Roles",
+             str(len((mpr.sections.get('security', {}) or {}).get('user_roles', [])))
+             if mpr else "—"),
             ("📦", "Libraries", str(len(scan.libraries))),
             ("🌐", "RTL / Arabic", "Yes" if scan.has_rtl else "No"),
             ("📱", "Native Mobile", "Yes" if scan.has_native else "No"),
@@ -307,6 +465,31 @@ class MendixAnalyzerApp(tk.Tk):
             tk.Label(c, text=icon, bg=CARD, font=("Segoe UI", 18)).pack()
             tk.Label(c, text=val, bg=CARD, fg=ACCENT2, font=FONT_BOLD).pack()
             tk.Label(c, text=lbl, bg=CARD, fg=MUTED, font=FONT_SMALL).pack()
+
+        # MPR extraction banner (only when full dump succeeded)
+        if mpr is not None:
+            banner = tk.Frame(self.scan_results_frame, bg=CARD,
+                              highlightthickness=1, highlightbackground=ACCENT2)
+            banner.pack(fill="x", padx=32, pady=(10, 4))
+            tk.Label(banner,
+                     text=f"📦  Full MPR dump loaded — "
+                          f"{mpr.raw_unit_count:,} units across 19 sections "
+                          f"(extracted in {mpr.duration_seconds}s).  "
+                          f"This data will be sent to the AI agents as the analysis context.",
+                     bg=CARD, fg=ACCENT2, font=FONT_SMALL,
+                     wraplength=900, justify="left",
+                     padx=14, pady=10).pack(anchor="w")
+        elif scan.mpr_path and getattr(scan, "mpr_error", ""):
+            warn = tk.Frame(self.scan_results_frame, bg=CARD,
+                            highlightthickness=1, highlightbackground=RED)
+            warn.pack(fill="x", padx=32, pady=(10, 4))
+            tk.Label(warn,
+                     text=f"⚠  MPR dump failed — {scan.mpr_error}\n"
+                          f"The dashboard counts marked '—' come from `mx dump-mpr`. "
+                          f"Install Mendix Studio Pro 10+ and re-scan to populate them.",
+                     bg=CARD, fg=RED, font=FONT_SMALL,
+                     wraplength=900, justify="left",
+                     padx=14, pady=10).pack(anchor="w")
 
         # Module table (top 20 business modules)
         self._section_label(self.scan_results_frame, f"Business Modules ({len(biz)} found)")
@@ -672,6 +855,12 @@ class MendixAnalyzerApp(tk.Tk):
             lbl.pack()
             self.step_labels[key] = lbl
 
+        # Animated loader (hidden until analysis starts)
+        self.loader_container = tk.Frame(page, bg=BG)
+        self.loader_container.pack(fill="x", padx=32, pady=(0, 8))
+        self.loader = LoaderPanel(self.loader_container)
+        # do not pack yet — shown on _start_analysis
+
         # Progress bar
         pb_frame = tk.Frame(page, bg=BG)
         pb_frame.pack(fill="x", padx=32, pady=(0, 8))
@@ -772,13 +961,19 @@ class MendixAnalyzerApp(tk.Tk):
         self._progress_step = 0
         self._progress_total = n_enabled
 
+        # Show & start the loader
+        self.loader.pack(fill="x")
+        self.loader.start(total_stages=n_enabled)
+
         def on_token(tok: str):
             self.log_queue.put((tok, "normal"))
+            self.loader.add_tokens(len(tok))
 
         def on_stage(label: str):
             self._progress_step += 1
             pct = (self._progress_step - 1) / max(self._progress_total, 1) * 100
-            self.after(0, lambda l=label, p=pct: self._update_stage(l, p))
+            self.after(0, lambda l=label, p=pct, idx=self._progress_step:
+                       self._update_stage(l, p, idx))
 
         def on_done(results: dict):
             self.after(0, lambda: self._on_analysis_done(results))
@@ -796,11 +991,13 @@ class MendixAnalyzerApp(tk.Tk):
         self._log("\n⏹  Stopped by user.\n", "err")
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.loader.fail("Stopped by user")
         self.status_bar.set("Stopped", MUTED)
 
-    def _update_stage(self, label: str, pct: float):
+    def _update_stage(self, label: str, pct: float, idx: int = 0):
         self.var_progress.set(pct)
         self.progress_lbl.configure(text=f"Running: {label}")
+        self.loader.set_stage(label, idx)
         self._log(f"\n\n{'='*60}\n  {label}\n{'='*60}\n\n", "stage")
         # Update step indicator
         for key, lbl in self.step_labels.items():
@@ -818,6 +1015,9 @@ class MendixAnalyzerApp(tk.Tk):
         self.progress_lbl.configure(text="✅ Analysis complete")
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.loader.stop()
+        # Hide loader after a short delay so user sees the success state
+        self.after(2500, lambda: self.loader.pack_forget())
         self._log("\n\n✅  All agents complete. Generating report...\n", "stage")
         # Auto-generate report
         self._generate_report(results)
@@ -878,10 +1078,10 @@ class MendixAnalyzerApp(tk.Tk):
         sections_frame = tk.Frame(page, bg=BG)
         sections_frame.pack(fill="x", padx=32)
         section_defs = [
-            ("🏗️", "Architecture",    "System structure, modules, domain model, integrations, risks"),
-            ("💼", "Business Analysis","Actors, processes, epics, user stories, acceptance criteria"),
-            ("🧪", "QA Report",       "Requirement gaps, test scenarios, risk analysis, NFRs"),
-            ("📄", "Consolidation",   "Executive summary, key risks, top recommendations"),
+            ("🏗️", "§1-2,7 Architecture & Domain", "System overview, architecture style, domain model with bounded contexts, ERD/architecture/sequence PlantUML diagrams"),
+            ("💼", "§4-5 Business & UI",            "Actors, business processes, 15+ user stories, business rules, page-to-process mapping, UX concerns"),
+            ("🧪", "§3,6,8 Microflows · Security · Risks", "Microflow patterns, decision/integration points, roles & permissions, security risks, technical/performance/maintainability risks"),
+            ("📄", "§9 Final Summary",              "Executive summary, system maturity verdict, strengths, weaknesses, critical risks, top 10 recommendations, production readiness"),
         ]
         for i, (icon, title, desc) in enumerate(section_defs):
             c = tk.Frame(sections_frame, bg=CARD, padx=16, pady=14)
@@ -897,7 +1097,11 @@ class MendixAnalyzerApp(tk.Tk):
         if not self.scan_result:
             return
         gen  = ReportGenerator()
-        path = str(Path.home() / "Desktop" / f"MendixReport_{datetime.datetime.now():%Y%m%d_%H%M%S}.html")
+        out_dir = Path.home() / "Desktop"
+        if not out_dir.exists():
+            out_dir = Path.home() / "MendixReports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = str(out_dir / f"MendixReport_{datetime.datetime.now():%Y%m%d_%H%M%S}.html")
         gen.save(self.scan_result, results, path)
         self.report_path = path
         self.report_path_lbl.configure(text=path)

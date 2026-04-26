@@ -41,3 +41,7 @@ desktop.ini
 # ── Logs ──────────────────────────────────────────────────────────────
 *.log
 *.tmp
+
+# ── MPR extraction scratch dumps (local debugging artefacts) ──────────
+dumps/
+reports/

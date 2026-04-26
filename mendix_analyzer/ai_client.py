@@ -151,22 +151,23 @@ class AIClient:
         model: str,
         messages: List[Dict],
         on_token: Optional[Callable[[str], None]] = None,
-        temperature: float = 0.4,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
     ) -> str:
         if self.api_type == "builtin":
             return _run_builtin(model, messages, on_token, temperature)
         if self.api_type == "ollama":
-            return self._chat_ollama(model, messages, on_token, temperature)
-        return self._chat_openai(model, messages, on_token, temperature)
+            return self._chat_ollama(model, messages, on_token, temperature, max_tokens)
+        return self._chat_openai(model, messages, on_token, temperature, max_tokens)
 
     # ------------------------------------------------------------------ #
-    def _chat_ollama(self, model, messages, on_token, temperature) -> str:
+    def _chat_ollama(self, model, messages, on_token, temperature, max_tokens) -> str:
         url     = f"{self.base_url}/api/chat"
         payload = {
             "model": model,
             "messages": messages,
             "stream": bool(on_token),
-            "options": {"temperature": temperature},
+            "options": {"temperature": temperature, "num_predict": max_tokens},
         }
         full = ""
         if on_token:
@@ -193,16 +194,17 @@ class AIClient:
             full = r.json().get("message", {}).get("content", "")
         return full
 
-    def _chat_openai(self, model, messages, on_token, temperature) -> str:
+    def _chat_openai(self, model, messages, on_token, temperature, max_tokens) -> str:
         url     = f"{self.base_url}/v1/chat/completions"
         payload = {
             "model": model,
             "messages": messages,
             "stream": bool(on_token),
             "temperature": temperature,
+            "max_tokens": max_tokens,
         }
-        full = ""
         if on_token:
+            content_buf, reasoning_buf, in_reasoning = "", "", False
             with requests.post(url, json=payload, stream=True,
                                headers=self._headers, timeout=600) as r:
                 r.raise_for_status()
@@ -216,16 +218,29 @@ class AIClient:
                     if data_str.strip() == "[DONE]":
                         break
                     try:
-                        d   = json.loads(data_str)
-                        tok = d["choices"][0]["delta"].get("content", "")
-                        if tok:
-                            full += tok
-                            on_token(tok)
-                    except (json.JSONDecodeError, KeyError):
-                        pass
+                        delta = json.loads(data_str)["choices"][0].get("delta", {})
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+                    rtok = delta.get("reasoning_content") or ""
+                    ctok = delta.get("content") or ""
+                    if rtok:
+                        if not in_reasoning:
+                            in_reasoning = True
+                            on_token("💭 [thinking] ")
+                        reasoning_buf += rtok
+                        on_token(rtok)
+                    if ctok:
+                        if in_reasoning:
+                            in_reasoning = False
+                            on_token("\n\n💡 [answer]\n")
+                        content_buf += ctok
+                        on_token(ctok)
+            # Reasoning models may exhaust max_tokens before producing content.
+            # In that case surface the reasoning as the answer so the report has data.
+            return content_buf or reasoning_buf
         else:
             payload["stream"] = False
             r = requests.post(url, json=payload, headers=self._headers, timeout=600)
             r.raise_for_status()
-            full = r.json()["choices"][0]["message"]["content"]
-        return full
+            msg = r.json()["choices"][0]["message"]
+            return msg.get("content") or msg.get("reasoning_content") or ""
