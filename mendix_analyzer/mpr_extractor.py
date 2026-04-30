@@ -208,13 +208,18 @@ class ExtractedData:
                           compact: bool = False) -> str:
         """Compact, AI-friendly digest of the 19 sections.
 
-        When `compact=True`, the digest is shrunk by ~50% so the full prompt
-        (system + this digest + filesystem scan) can fit inside an 8K-token
-        window. It tightens `max_modules`/`max_per_module`, drops the per-role
-        security listing, and omits the integrations detail block.
+        When `compact=True`, the digest is shrunk so the full prompt (system +
+        this digest + filesystem scan) can fit inside an 8K-token window. It
+        tightens `max_per_module` and drops the per-role security listing.
+        Integrations and Published / Consumed REST/SOAP services are ALWAYS
+        emitted (capped lower in compact mode) because the BA agent needs them
+        to enumerate the project's external service surface.
         """
         if compact:
-            max_modules = min(max_modules, 15)
+            # Cap at 25 so a 24-module project (StateOwnedEnterprice) is
+            # represented in full; smaller per-module body keeps the prompt
+            # under an 8K window.
+            max_modules = min(max_modules, 25)
             max_per_module = min(max_per_module, 3)
         s = self.sections
         c = self.counts
@@ -281,13 +286,43 @@ class ExtractedData:
                 names = ", ".join(f"{wf['name']}({wf.get('state_count',0)} states)" for wf in wfs[:4])
                 lines.append(f"  Workflows: {names}")
 
-        # Integrations
+        # External service surface — ALWAYS emitted (capped lower in compact
+        # mode). The BA agent depends on these blocks to enumerate the
+        # project's published REST/SOAP endpoints and external consumers; a
+        # missing block causes section 4.5 to be omitted from the report.
+        pubs = s.get("published_services", []) or []
+        cons = s.get("consumed_services", []) or []
         ints = s.get("integrations", []) or []
-        if ints and not compact:
+        cap_int = 8 if compact else 15
+        cap_svc = 10 if compact else 20
+
+        if pubs:
+            lines += ["", f"=== PUBLISHED REST/SOAP SERVICES ({len(pubs)}) ==="]
+            for p in pubs[:cap_svc]:
+                lines.append(f"  • [{p.get('kind','')}] {p.get('qualified_name','')}"
+                             f"  module={p.get('module','')}"
+                             f"  path={p.get('path','') or '-'}"
+                             f"  v={p.get('version','') or '-'}")
+            if len(pubs) > cap_svc:
+                lines.append(f"  ...(+{len(pubs)-cap_svc} more)")
+
+        if cons:
+            lines += ["", f"=== CONSUMED REST/SOAP SERVICES ({len(cons)}) ==="]
+            for c2 in cons[:cap_svc]:
+                lines.append(f"  • [{c2.get('kind','')}] {c2.get('qualified_name','')}"
+                             f"  module={c2.get('module','')}"
+                             f"  endpoint={c2.get('location','') or '-'}")
+            if len(cons) > cap_svc:
+                lines.append(f"  ...(+{len(cons)-cap_svc} more)")
+
+        if ints:
             lines += ["", f"=== INTEGRATIONS ({len(ints)}) ==="]
-            for it in ints[:15]:
+            for it in ints[:cap_int]:
                 lines.append(f"  • [{it.get('direction','')}/{it.get('kind','')}] "
-                             f"{it.get('qualified_name','')} {it.get('path') or it.get('location','')}")
+                             f"{it.get('qualified_name','')} "
+                             f"{it.get('path') or it.get('location','')}")
+            if len(ints) > cap_int:
+                lines.append(f"  ...(+{len(ints)-cap_int} more)")
 
         return "\n".join(lines)
 
