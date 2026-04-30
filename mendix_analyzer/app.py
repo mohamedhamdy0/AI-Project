@@ -198,6 +198,7 @@ class MendixAnalyzerApp(tk.Tk):
         self.var_en_ba    = tk.BooleanVar(value=True)
         self.var_en_qa    = tk.BooleanVar(value=True)
         self.var_en_cons  = tk.BooleanVar(value=True)
+        self.var_compact  = tk.BooleanVar(value=False)
         self.var_progress = tk.DoubleVar(value=0)
         self.var_status   = tk.StringVar(value="Ready")
 
@@ -402,15 +403,19 @@ class MendixAnalyzerApp(tk.Tk):
         self._render_scan_results(result)
         if result.mpr_data is not None:
             c = result.mpr_data.counts
+            n_files = len(result.mpr_data.section_files)
+            dump_dir = result.mpr_data.dump_dir or "?"
             self.scan_progress_lbl.configure(
                 text=f"✅ MPR extracted in {result.mpr_data.duration_seconds}s · "
                      f"{result.mpr_data.raw_unit_count:,} units · "
                      f"{c['entities']} entities · {c['microflows']} microflows · "
-                     f"{c['pages']} pages · {c['workflows']} workflows",
+                     f"{c['pages']} pages · {c['workflows']} workflows · "
+                     f"{n_files} JSON files → {dump_dir}",
                 fg=GREEN)
             self.status_bar.set(
                 f"✅ {result.project_name} — full MPR loaded "
-                f"({c['entities']} entities, {c['microflows']} microflows)", GREEN)
+                f"({c['entities']} entities, {c['microflows']} microflows, "
+                f"split into {n_files} per-section files)", GREEN)
         else:
             if result.mpr_path and getattr(result, "mpr_error", ""):
                 self.scan_progress_lbl.configure(
@@ -831,6 +836,16 @@ class MendixAnalyzerApp(tk.Tk):
                            selectcolor=PANEL, activebackground=CARD,
                            activeforeground=TEXT).pack(anchor="w", pady=2)
 
+        # Compact-context toggle (helps fit small n_ctx windows like LM Studio's 4K default)
+        tk.Frame(toggle_card, bg=CARD, height=8).pack()
+        tk.Label(toggle_card, text="CONTEXT SIZE", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x")
+        tk.Checkbutton(toggle_card, text="🪶  Compact context (≤8K window)",
+                       variable=self.var_compact,
+                       bg=CARD, fg=TEXT, font=FONT,
+                       selectcolor=PANEL, activebackground=CARD,
+                       activeforeground=TEXT).pack(anchor="w", pady=2)
+
         # Start / Stop buttons
         btn_frame = tk.Frame(ctrl, bg=BG)
         btn_frame.pack(side="left", padx=32)
@@ -955,7 +970,48 @@ class MendixAnalyzerApp(tk.Tk):
         self._reset_steps()
 
         scanner = MendixScanner()
-        context = scanner.to_context_string(self.scan_result)
+        compact = self.var_compact.get()
+        context = scanner.to_context_string(self.scan_result, compact=compact)
+
+        # Pre-flight: refuse to launch when the prompt + reply budget cannot
+        # fit inside any plausible local-provider window. LM Studio / Ollama
+        # default to n_ctx=4096 and silently fail with an `event: error` SSE
+        # frame once exceeded — agents then return empty output. The check
+        # below is the only reliable guard short of querying n_ctx (which the
+        # OpenAI-compatible API does not expose).
+        approx_prompt_tokens = len(context) // 4 + 500  # +system prompt overhead
+        reply_budget = 8192
+        needed_ctx = approx_prompt_tokens + reply_budget
+        provider = self.var_provider.get()
+        if needed_ctx > 8000 and provider != "Built-in (GGUF)":
+            recommend_ctx = 32768 if needed_ctx <= 32768 else 65536
+            tip = ("\n\nTip: enable 🪶 Compact context (≤8K window) on the left to "
+                   "shrink the prompt — for some projects that alone is enough.")
+            cont = messagebox.askyesno(
+                "Context window too small — analysis will fail",
+                f"This project's prompt is ~{approx_prompt_tokens:,} tokens.\n"
+                f"With an 8K reply budget the model needs n_ctx ≥ "
+                f"~{needed_ctx:,}.\n\n"
+                f"{provider} defaults to n_ctx=4096, which will produce EMPTY "
+                f"reports (silent SSE error: \"n_keep ≥ n_ctx\").\n\n"
+                f"Required action BEFORE clicking Yes:\n"
+                f"  • LM Studio: open the loaded model's settings → "
+                f"Context Length → {recommend_ctx} → reload.\n"
+                f"  • Ollama:    set OLLAMA_NUM_CTX={recommend_ctx} (env var) "
+                f"or use a long-context model.\n"
+                f"{tip if not compact else ''}\n\n"
+                f"Have you already increased the context length? Click Yes to "
+                f"continue, No to cancel.",
+                icon="warning",
+            )
+            if not cont:
+                self.start_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+                self.loader.pack_forget()
+                self.status_bar.set(
+                    f"Cancelled — set the model's n_ctx to ≥{recommend_ctx} "
+                    f"or enable 🪶 Compact context.", YELLOW)
+                return
 
         n_enabled = sum(enabled.values())
         self._progress_step = 0

@@ -45,3 +45,9 @@ desktop.ini
 # ── MPR extraction scratch dumps (local debugging artefacts) ──────────
 dumps/
 reports/
+
+# ── Diagnostic script transient outputs ───────────────────────────────
+scripts/*.out.txt
+scripts/mx_help*.txt
+scripts/verify_split.out.txt
+scripts/split_dump.out.txt

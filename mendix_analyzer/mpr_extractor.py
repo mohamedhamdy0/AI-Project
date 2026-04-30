@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +34,34 @@ DEFAULT_UNIT_TYPES = [
     "Rest$ConsumedRestService",
     "WebServices$PublishedWebService",
 ]
+
+# Well-known Mendix Marketplace / App-Store module names. `mx dump-mpr
+# --exclude-protected-modules` skips modules that are imported as locked
+# (the modern default), but older imports often store these as unprotected.
+# We post-filter by name as a safety net so business analysis isn't polluted
+# by Atlas widgets, CommunityCommons utility flows, etc.
+MARKETPLACE_MODULES: set = {
+    # Atlas UI / styling
+    "Atlas_Core", "Atlas_UI_Resources", "Atlas_NativeMobile_Resources",
+    "Atlas_Web_Content", "AtlasUI_Resources", "BootstrapStyle",
+    "LayoutGrid",
+    # Common utility modules
+    "CommunityCommons", "NanoflowCommons", "Nanoflow_Commons",
+    "Encryption", "MxModelReflection", "WorkflowCommons",
+    "DataWidgets", "DocumentTemplates",
+    # Native mobile
+    "NativeMobileResources", "Nanoflow_Commons_Native",
+    # Charts / visualisation
+    "Charts", "ChartsConfiguration", "ChartsAddOn",
+    # Import / export utilities
+    "ExcelImporter", "ExcelExporter", "FileDocumentDownloader",
+    # Other common marketplace add-ons
+    "DeepLink", "EmailTemplate", "PerformanceMonitor",
+    "AppCloudServices", "MxAssistAvailable", "MxAssistContentSuggester",
+    "ConflictsResolver", "ObjectHandling",
+    # Authentication add-ons
+    "SAML20", "OIDC", "OpenIDConnect", "LDAPLogin",
+}
 
 ProgressCB = Optional[Callable[[str], None]]
 
@@ -106,7 +133,9 @@ class ExtractedData:
     """Result of an MPR extraction."""
     project_name: str = ""
     mpr_path: str = ""
-    dump_path: str = ""
+    dump_dir: str = ""           # directory containing per-section JSON files
+    dump_path: str = ""           # kept for backwards-compat: points at dump_dir
+    section_files: Dict[str, str] = field(default_factory=dict)  # section -> file
     sections: Dict[str, object] = field(default_factory=dict)  # 19-section structure
     duration_seconds: float = 0.0
     raw_unit_count: int = 0
@@ -144,8 +173,49 @@ class ExtractedData:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.sections, f, ensure_ascii=False, indent=2)
 
-    def to_context_string(self, max_modules: int = 20, max_per_module: int = 6) -> str:
-        """Compact, AI-friendly digest of the 19 sections."""
+    def save_split_json(self, dump_dir: str) -> Dict[str, str]:
+        """Write each of the 19 sections to its own JSON file under `dump_dir`.
+
+        Returns a {section_name: file_path} map and also writes a `_manifest.json`
+        summarising counts. Used by the GUI so users can inspect microflows.json,
+        pages.json, etc. independently of the giant raw dump.
+        """
+        d = Path(dump_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        files: Dict[str, str] = {}
+        for key, value in self.sections.items():
+            path = d / f"{key}.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(value, f, ensure_ascii=False, indent=2)
+            files[key] = str(path)
+        manifest = {
+            "project_name": self.project_name,
+            "mpr_path": self.mpr_path,
+            "duration_seconds": self.duration_seconds,
+            "raw_unit_count": self.raw_unit_count,
+            "counts": self.counts,
+            "sections": list(self.sections.keys()),
+            "files": files,
+        }
+        with open(d / "_manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        self.section_files = files
+        self.dump_dir = str(d)
+        self.dump_path = str(d)
+        return files
+
+    def to_context_string(self, max_modules: int = 20, max_per_module: int = 6,
+                          compact: bool = False) -> str:
+        """Compact, AI-friendly digest of the 19 sections.
+
+        When `compact=True`, the digest is shrunk by ~50% so the full prompt
+        (system + this digest + filesystem scan) can fit inside an 8K-token
+        window. It tightens `max_modules`/`max_per_module`, drops the per-role
+        security listing, and omits the integrations detail block.
+        """
+        if compact:
+            max_modules = min(max_modules, 15)
+            max_per_module = min(max_per_module, 3)
         s = self.sections
         c = self.counts
         lines: List[str] = [
@@ -167,8 +237,9 @@ class ExtractedData:
                   f"  User roles: {len(sec.get('user_roles', []))} | "
                   f"Module roles: {len(sec.get('module_roles', []))} | "
                   f"Access rules: {len(sec.get('access_rules', []))}"]
-        for r in (sec.get("user_roles") or [])[:8]:
-            lines.append(f"    • {r.get('name','')} ({len(r.get('module_roles',[]))} module roles)")
+        if not compact:
+            for r in (sec.get("user_roles") or [])[:8]:
+                lines.append(f"    • {r.get('name','')} ({len(r.get('module_roles',[]))} module roles)")
 
         # Modules
         mods = s.get("modules", []) or []
@@ -212,7 +283,7 @@ class ExtractedData:
 
         # Integrations
         ints = s.get("integrations", []) or []
-        if ints:
+        if ints and not compact:
             lines += ["", f"=== INTEGRATIONS ({len(ints)}) ==="]
             for it in ints[:15]:
                 lines.append(f"  • [{it.get('direction','')}/{it.get('kind','')}] "
@@ -260,7 +331,19 @@ class MPRExtractor:
     # ------- Main entry point ------- #
 
     def extract(self, mpr_path: str, on_progress: ProgressCB = None,
-                keep_dump: bool = True) -> ExtractedData:
+                dump_dir: Optional[str] = None,
+                keep_raw_dump: bool = False) -> ExtractedData:
+        """Run `mx dump-mpr` (excluding system + protected/marketplace modules),
+        then split the result into per-section JSON files.
+
+        Args:
+            mpr_path:       absolute path to the .mpr file.
+            on_progress:    optional progress callback.
+            dump_dir:       directory to write the per-section JSON files into.
+                            Defaults to <cwd>/dumps/<project_stem>/.
+            keep_raw_dump:  if True, keeps the giant intermediate `_raw_dump.json`
+                            for debugging. Otherwise it is deleted after splitting.
+        """
         if not self.is_available():
             raise RuntimeError(
                 "mx.exe not found. Install Mendix Studio Pro or set its install dir on PATH.")
@@ -275,33 +358,56 @@ class MPRExtractor:
             sections=_empty_sections(),
         )
 
-        dump_dir = Path(tempfile.gettempdir()) / "mendix_mpr_dumps"
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        dump_file = dump_dir / f"{mpr.stem}_dump.json"
-        if keep_dump:
-            result.dump_path = str(dump_file)
+        # Per-project output folder for split files
+        out_dir = Path(dump_dir) if dump_dir else (Path.cwd() / "dumps" / mpr.stem)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        raw_dump = out_dir / "_raw_dump.json"
 
-        self._notify(on_progress, f"Running mx dump-mpr on {mpr.name} ...")
-        ok = self._run_dump(mpr, dump_file, DEFAULT_UNIT_TYPES, on_progress)
+        self._notify(on_progress,
+                     f"Running mx dump-mpr on {mpr.name} (excluding system & "
+                     f"protected/marketplace modules) ...")
+        ok = self._run_dump(mpr, raw_dump, DEFAULT_UNIT_TYPES, on_progress,
+                            exclude_protected=True)
+        if not ok:
+            # First fallback: same flags but drop --exclude-protected-modules
+            # (older mx may not have it).
+            self._notify(on_progress,
+                         "Retrying without --exclude-protected-modules ...")
+            ok = self._run_dump(mpr, raw_dump, DEFAULT_UNIT_TYPES, on_progress,
+                                exclude_protected=False)
         if not ok:
             self._notify(on_progress,
                          "Retrying with reduced unit types (integration types not supported)...")
             reduced = [t for t in DEFAULT_UNIT_TYPES
                        if not (t.startswith("Rest$") or t.startswith("WebServices$")
                                or t.startswith("MicroflowExpressions$"))]
-            ok = self._run_dump(mpr, dump_file, reduced, on_progress)
+            ok = self._run_dump(mpr, raw_dump, reduced, on_progress,
+                                exclude_protected=False)
             if not ok:
                 raise RuntimeError("mx dump-mpr failed; see logs for details.")
 
-        size_mb = dump_file.stat().st_size / (1024 * 1024)
+        size_mb = raw_dump.stat().st_size / (1024 * 1024)
         self._notify(on_progress, f"Loading JSON dump ({size_mb:.1f} MB)...")
-        with open(dump_file, "r", encoding="utf-8-sig") as f:
+        with open(raw_dump, "r", encoding="utf-8-sig") as f:
             payload = json.load(f)
         units: List[dict] = payload.get("units", []) if isinstance(payload, dict) else []
         result.raw_unit_count = len(units)
 
         self._notify(on_progress, f"Transforming {len(units):,} units into 19 sections...")
         self._transform(units, result.sections, on_progress)
+
+        # Write per-section JSON files (microflows.json, pages.json, ...)
+        self._notify(on_progress,
+                     f"Writing per-section JSON files to {out_dir} ...")
+        files = result.save_split_json(str(out_dir))
+        self._notify(on_progress,
+                     f"Wrote {len(files)} section files + _manifest.json.")
+
+        if not keep_raw_dump:
+            try:
+                raw_dump.unlink()
+            except OSError:
+                pass
 
         result.duration_seconds = round(time.time() - t0, 2)
         self._notify(on_progress,
@@ -315,13 +421,17 @@ class MPRExtractor:
     # ------- mx dump-mpr invocation ------- #
 
     def _run_dump(self, mpr: Path, output: Path, unit_types: List[str],
-                  on_progress: ProgressCB) -> bool:
+                  on_progress: ProgressCB,
+                  exclude_protected: bool = True) -> bool:
         cmd = [
             str(self.mx_exe), "dump-mpr", str(mpr),
             "--output-file", str(output),
             "--exclude-system-module",
             "--unit-type", ",".join(unit_types),
         ]
+        if exclude_protected:
+            # Marketplace / App Store modules are imported as "protected".
+            cmd.append("--exclude-protected-modules")
         if output.exists():
             output.unlink()
         try:
@@ -350,10 +460,46 @@ class MPRExtractor:
 
     # ------- Transformation: units → 19-section schema ------- #
 
+    @staticmethod
+    def _unit_module_name(u: dict) -> str:
+        """Best-effort module name for a unit. Returns '' for project-scoped
+        units like Security$ProjectSecurity that aren't tied to a module."""
+        qn = u.get("$QualifiedName") or ""
+        if qn and "." in qn:
+            return qn.split(".", 1)[0]
+        t = u.get("$Type") or ""
+        # DomainModel and ModuleSecurity store the bare module name (no dot)
+        # in $QualifiedName, or none at all — derive from a child element.
+        if t == "DomainModels$DomainModel":
+            if qn:
+                return qn
+            for e in (u.get("entities") or []):
+                eq = e.get("$QualifiedName") or ""
+                if "." in eq:
+                    return eq.split(".", 1)[0]
+        elif t == "Security$ModuleSecurity":
+            if qn:
+                return qn
+            for r in (u.get("moduleRoles") or []):
+                rq = r.get("$QualifiedName") or ""
+                if "." in rq:
+                    return rq.split(".", 1)[0]
+        return ""
+
     def _transform(self, units: List[dict], sections: Dict[str, object],
                    on_progress: ProgressCB) -> None:
         modules: Dict[str, dict] = {}    # name -> module record
         entity_uuid_to_qn: Dict[str, str] = {}
+
+        # Drop units belonging to known marketplace modules (--exclude-protected-modules
+        # only catches *protected* imports; older unprotected imports slip through).
+        before = len(units)
+        units = [u for u in units
+                 if self._unit_module_name(u) not in MARKETPLACE_MODULES]
+        skipped = before - len(units)
+        if skipped:
+            self._notify(on_progress,
+                         f"Filtered out {skipped} unit(s) from known marketplace modules.")
 
         # Pass 1: collect entities + uuid map (also seeds modules)
         for u in units:

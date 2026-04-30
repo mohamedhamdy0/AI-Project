@@ -291,7 +291,14 @@ class MendixScanner:
             return []
         return list(dict.fromkeys(self._ENUM_VALUE_RE.findall(m.group(1))))
 
-    def to_context_string(self, scan: ProjectScan) -> str:
+    def to_context_string(self, scan: ProjectScan, compact: bool = False) -> str:
+        """Build the full project context string sent to the AI agents.
+
+        When `compact=True`, the digest is shrunk so the full prompt fits
+        inside an 8K-token window: the mpr_data digest is rebuilt with
+        `compact=True`, the per-module filesystem appendix is replaced by a
+        short summary, and the libraries listing is trimmed.
+        """
         biz = scan.business_modules
         total_microflows = sum(len(m.microflow_names) for m in scan.modules)
         total_attrs = sum(
@@ -305,12 +312,31 @@ class MendixScanner:
                 "================================================================",
                 " FULL MPR DUMP — extracted via `mx dump-mpr` (19-section schema)",
                 "================================================================",
-                scan.mpr_data.to_context_string(max_modules=40, max_per_module=8),
-                "",
-                "================================================================",
-                " FILESYSTEM SCAN — javasource / userlib / resources",
-                "================================================================",
+                scan.mpr_data.to_context_string(
+                    max_modules=40, max_per_module=8, compact=compact),
             ]
+            if not compact:
+                lines += [
+                    "",
+                    "================================================================",
+                    " FILESYSTEM SCAN — javasource / userlib / resources",
+                    "================================================================",
+                ]
+
+        # In compact mode we only emit a one-block headline + integration
+        # libraries; the per-module Java-proxy detail is redundant with the
+        # mpr_data digest above and adds ~2K chars for no extra signal.
+        if compact and scan.mpr_data is not None:
+            lines += [
+                "",
+                f"FILESYSTEM HEADLINES: mendix={scan.mendix_version} · "
+                f"git={scan.has_git} · native={scan.has_native} · rtl={scan.has_rtl} · "
+                f"libs={len(scan.libraries)} · widgets={len(scan.widgets)}",
+                "",
+                "=== KEY INTEGRATION LIBRARIES ===",
+                ", ".join(scan.integration_libraries[:15]) or "None detected",
+            ]
+            return "\n".join(lines)
 
         lines += [
             f"PROJECT NAME: {scan.project_name}",

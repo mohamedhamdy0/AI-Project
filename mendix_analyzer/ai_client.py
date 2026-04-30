@@ -179,19 +179,24 @@ class AIClient:
                         continue
                     try:
                         d = json.loads(line)
-                        tok = d.get("message", {}).get("content", "")
-                        if tok:
-                            full += tok
-                            on_token(tok)
-                        if d.get("done"):
-                            break
                     except json.JSONDecodeError:
-                        pass
+                        continue
+                    if isinstance(d, dict) and d.get("error"):
+                        raise RuntimeError(f"Ollama error: {d['error']}")
+                    tok = d.get("message", {}).get("content", "")
+                    if tok:
+                        full += tok
+                        on_token(tok)
+                    if d.get("done"):
+                        break
         else:
             payload["stream"] = False
             r = requests.post(url, json=payload, headers=self._headers, timeout=600)
             r.raise_for_status()
-            full = r.json().get("message", {}).get("content", "")
+            j = r.json()
+            if isinstance(j, dict) and j.get("error"):
+                raise RuntimeError(f"Ollama error: {j['error']}")
+            full = j.get("message", {}).get("content", "")
         return full
 
     def _chat_openai(self, model, messages, on_token, temperature, max_tokens) -> str:
@@ -205,21 +210,40 @@ class AIClient:
         }
         if on_token:
             content_buf, reasoning_buf, in_reasoning = "", "", False
+            current_event = "message"  # default SSE event
             with requests.post(url, json=payload, stream=True,
                                headers=self._headers, timeout=600) as r:
-                r.raise_for_status()
+                if r.status_code != 200:
+                    raise RuntimeError(
+                        f"HTTP {r.status_code} from {self.base_url}: {r.text[:500]}")
                 for raw in r.iter_lines():
                     if not raw:
                         continue
-                    line = raw.decode() if isinstance(raw, bytes) else raw
+                    line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+                    # Track SSE event: lines (LM Studio uses `event: error` for failures)
+                    if line.startswith("event: "):
+                        current_event = line[7:].strip()
+                        continue
                     if not line.startswith("data: "):
                         continue
                     data_str = line[6:]
                     if data_str.strip() == "[DONE]":
                         break
                     try:
-                        delta = json.loads(data_str)["choices"][0].get("delta", {})
-                    except (json.JSONDecodeError, KeyError, IndexError):
+                        obj = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    # Inline error payload (LM Studio sends `event: error` then a data
+                    # line containing `{"error": {"message": ...}}`)
+                    err = obj.get("error") if isinstance(obj, dict) else None
+                    if current_event == "error" or err:
+                        msg = (err.get("message") if isinstance(err, dict)
+                               else (obj.get("message") or str(err) if err
+                                     else "Unknown upstream error"))
+                        raise RuntimeError(f"Upstream provider error: {msg}")
+                    try:
+                        delta = obj["choices"][0].get("delta", {}) or {}
+                    except (KeyError, IndexError):
                         continue
                     rtok = delta.get("reasoning_content") or ""
                     ctok = delta.get("content") or ""
@@ -241,6 +265,13 @@ class AIClient:
         else:
             payload["stream"] = False
             r = requests.post(url, json=payload, headers=self._headers, timeout=600)
-            r.raise_for_status()
-            msg = r.json()["choices"][0]["message"]
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"HTTP {r.status_code} from {self.base_url}: {r.text[:500]}")
+            j = r.json()
+            if isinstance(j, dict) and j.get("error"):
+                err = j["error"]
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                raise RuntimeError(f"Upstream provider error: {msg}")
+            msg = j["choices"][0]["message"]
             return msg.get("content") or msg.get("reasoning_content") or ""
