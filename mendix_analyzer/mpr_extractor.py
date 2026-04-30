@@ -461,7 +461,43 @@ class MPRExtractor:
     # ------- Transformation: units → 19-section schema ------- #
 
     @staticmethod
-    def _unit_module_name(u: dict) -> str:
+    def _build_module_id_index(units: List[dict]) -> Dict[str, str]:
+        """Map each parent Module's `$ID` to its name. The Mendix dump exposes
+        no `Projects$Module` unit, so this is the only reliable way to
+        attribute empty DomainModel and ModuleSecurity units (which carry no
+        name or QualifiedName of their own) to their owning module.
+
+        Two seed sources, in order:
+          1. Top-level units whose `$QualifiedName` is `ModuleName.X` and whose
+             `$ContainerID` therefore equals the parent Module's `$ID`
+             (Microflows, Pages, Workflows, Enumerations, Constants, services).
+          2. `Security$ModuleSecurity` units: walk their `moduleRoles[].$QualifiedName`
+             so that modules whose only content is security roles still get a name.
+        """
+        idx: Dict[str, str] = {}
+        for u in units:
+            qn = u.get("$QualifiedName") or ""
+            if "." not in qn:
+                continue
+            cid = u.get("$ContainerID") or ""
+            if not cid:
+                continue
+            idx.setdefault(cid, qn.split(".", 1)[0])
+        for u in units:
+            if u.get("$Type") != "Security$ModuleSecurity":
+                continue
+            cid = u.get("$ContainerID") or ""
+            if not cid or cid in idx:
+                continue
+            for r in (u.get("moduleRoles") or []):
+                rq = r.get("$QualifiedName") or ""
+                if "." in rq:
+                    idx[cid] = rq.split(".", 1)[0]
+                    break
+        return idx
+
+    @staticmethod
+    def _unit_module_name(u: dict, id_index: Optional[Dict[str, str]] = None) -> str:
         """Best-effort module name for a unit. Returns '' for project-scoped
         units like Security$ProjectSecurity that aren't tied to a module."""
         qn = u.get("$QualifiedName") or ""
@@ -469,7 +505,8 @@ class MPRExtractor:
             return qn.split(".", 1)[0]
         t = u.get("$Type") or ""
         # DomainModel and ModuleSecurity store the bare module name (no dot)
-        # in $QualifiedName, or none at all — derive from a child element.
+        # in $QualifiedName, or none at all — derive from a child element,
+        # or fall back to the parent-Module $ID lookup.
         if t == "DomainModels$DomainModel":
             if qn:
                 return qn
@@ -477,6 +514,8 @@ class MPRExtractor:
                 eq = e.get("$QualifiedName") or ""
                 if "." in eq:
                     return eq.split(".", 1)[0]
+            if id_index is not None:
+                return id_index.get(u.get("$ContainerID") or "", "")
         elif t == "Security$ModuleSecurity":
             if qn:
                 return qn
@@ -484,6 +523,8 @@ class MPRExtractor:
                 rq = r.get("$QualifiedName") or ""
                 if "." in rq:
                     return rq.split(".", 1)[0]
+            if id_index is not None:
+                return id_index.get(u.get("$ContainerID") or "", "")
         return ""
 
     def _transform(self, units: List[dict], sections: Dict[str, object],
@@ -491,11 +532,17 @@ class MPRExtractor:
         modules: Dict[str, dict] = {}    # name -> module record
         entity_uuid_to_qn: Dict[str, str] = {}
 
+        # Build the parent-Module $ID -> name index BEFORE filtering so empty
+        # DomainModel / ModuleSecurity units (which lack any name field) can
+        # still be attributed and, where applicable, matched against the
+        # MARKETPLACE_MODULES blocklist.
+        module_id_index = self._build_module_id_index(units)
+
         # Drop units belonging to known marketplace modules (--exclude-protected-modules
         # only catches *protected* imports; older unprotected imports slip through).
         before = len(units)
         units = [u for u in units
-                 if self._unit_module_name(u) not in MARKETPLACE_MODULES]
+                 if self._unit_module_name(u, module_id_index) not in MARKETPLACE_MODULES]
         skipped = before - len(units)
         if skipped:
             self._notify(on_progress,
@@ -505,7 +552,8 @@ class MPRExtractor:
         for u in units:
             t = u.get("$Type")
             if t == "DomainModels$DomainModel":
-                self._handle_domain_model(u, sections, modules, entity_uuid_to_qn)
+                self._handle_domain_model(u, sections, modules, entity_uuid_to_qn,
+                                          module_id_index)
 
         # Pass 2: handle other unit types using the uuid map
         for u in units:
@@ -523,7 +571,7 @@ class MPRExtractor:
             elif t == "Security$ProjectSecurity":
                 self._handle_project_security(u, sections)
             elif t == "Security$ModuleSecurity":
-                self._handle_module_security(u, sections, modules)
+                self._handle_module_security(u, sections, modules, module_id_index)
             elif t in ("Rest$PublishedRestService", "WebServices$PublishedWebService"):
                 self._handle_published_service(u, sections, modules)
             elif t in ("Rest$ConsumedRestService", "WebServices$ConsumedWebService"):
@@ -535,6 +583,23 @@ class MPRExtractor:
             assoc["child_entity"] = entity_uuid_to_qn.get(assoc.get("_child_uuid", ""), assoc.get("child_entity", ""))
             assoc.pop("_parent_uuid", None)
             assoc.pop("_child_uuid", None)
+
+        # Drop completely-empty, unattributed DM records: a DM with no module,
+        # no entities, and no associations is the leftover shell of a module
+        # whose name we couldn't recover from any source (rare marketplace or
+        # truly empty modules). These records carry zero analysis value and
+        # only inflate counts.
+        dms = sections["domain_models"]  # type: ignore[index]
+        kept_dms = [d for d in dms
+                    if d.get("module")
+                    or d.get("entity_count", 0)
+                    or d.get("association_count", 0)
+                    or d.get("cross_association_count", 0)]
+        dropped = len(dms) - len(kept_dms)
+        if dropped:
+            sections["domain_models"] = kept_dms  # type: ignore[index]
+            self._notify(on_progress,
+                         f"Dropped {dropped} empty unattributed domain model record(s).")
 
         # Finalize modules list
         sections["modules"] = sorted(modules.values(), key=lambda m: m["name"])
@@ -563,14 +628,22 @@ class MPRExtractor:
 
     def _handle_domain_model(self, u: dict, sections: Dict[str, object],
                              modules: Dict[str, dict],
-                             entity_uuid_to_qn: Dict[str, str]) -> None:
+                             entity_uuid_to_qn: Dict[str, str],
+                             module_id_index: Optional[Dict[str, str]] = None) -> None:
         entities = u.get("entities") or []
-        # Module name: derive from any entity's $QualifiedName
-        mod_name = ""
-        for e in entities:
-            mod_name = self._module_of(e.get("$QualifiedName"))
-            if mod_name:
-                break
+        # Module name: DomainModel units carry no $QualifiedName at all in
+        # the dump, so derive from the first entity's QN. When the DM is
+        # empty (no entities), fall back to the parent-Module $ID lookup
+        # built from sibling Microflow/Page/Enum units; without this fallback
+        # empty domain models become orphan records with module="".
+        mod_name = self._module_of(u.get("$QualifiedName"))
+        if not mod_name:
+            for e in entities:
+                mod_name = self._module_of(e.get("$QualifiedName"))
+                if mod_name:
+                    break
+        if not mod_name and module_id_index is not None:
+            mod_name = module_id_index.get(u.get("$ContainerID") or "", "")
         m = self._ensure_module(modules, mod_name) if mod_name else {}
 
         dm_record = {
@@ -917,10 +990,19 @@ class MPRExtractor:
         sections["security"]["guest_user_role_name"] = u.get("guestUserRoleName", "")  # type: ignore[index]
 
     def _handle_module_security(self, u: dict, sections: Dict[str, object],
-                                modules: Dict[str, dict]) -> None:
+                                modules: Dict[str, dict],
+                                module_id_index: Optional[Dict[str, str]] = None) -> None:
+        # Resolve the owning module up front from the parent-Module $ID
+        # index so that even role-less ModuleSecurity units (or roles whose
+        # own $QualifiedName is missing) get attributed correctly.
+        unit_mod = ""
+        if module_id_index is not None:
+            unit_mod = module_id_index.get(u.get("$ContainerID") or "", "")
+        if unit_mod:
+            self._ensure_module(modules, unit_mod)
         for r in (u.get("moduleRoles") or []):
             qn = r.get("$QualifiedName") or ""
-            mod = self._module_of(qn)
+            mod = self._module_of(qn) or unit_mod
             m = self._ensure_module(modules, mod)
             entry = {
                 "qualified_name": qn,
